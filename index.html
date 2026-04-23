@@ -7,7 +7,6 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2360A5FA' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9H4.5a2.5 2.5 0 0 1 0-5H6'/%3E%3Cpath d='M18 9h1.5a2.5 2.5 0 0 0 0-5H18'/%3E%3Cpath d='M4 22h16'/%3E%3Cpath d='M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22'/%3E%3Cpath d='M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22'/%3E%3Cpath d='M18 2H6v7a6 6 0 0 0 12 0V2Z'/%3E%3C/svg%3E" />
 
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://accounts.google.com/gsi/client" async defer></script>
 
   <script type="importmap">
   {
@@ -66,7 +65,6 @@
   </div>
 
   <script>
-    // Surface errors visibly rather than leaving the loading screen up forever
     function showTallyError(msg, detail) {
       var root = document.getElementById('root');
       if (root && root.querySelector('.tally-preload')) {
@@ -406,53 +404,6 @@ function autoDetectDateColumn(columns, hints) {
   return null;
 }
 
-/* ---------------- Field-mapping instruction sheet ----------------
- * Builds a human-readable text document describing how each uploaded source
- * is currently mapped — which column holds the name, which holds the count,
- * which holds the date — plus the points-per-action rule in effect.
- * Useful for documenting the setup, training a teammate, or validating that
- * next month's upload is being interpreted the same way.
- */
-function buildMappingInstructions(sources, sourceConfig, points) {
-  const lines = [];
-  lines.push('TALLY — FIELD MAPPING INSTRUCTIONS');
-  lines.push('');
-  lines.push('Confirm these dropdown selections each time you upload a');
-  lines.push('new report. If a column name changes, adjust the mapping to');
-  lines.push('match — otherwise scores may shift unexpectedly.');
-  lines.push('');
-  lines.push('─'.repeat(60));
-
-  for (const cfg of Object.values(sourceConfig)) {
-    const src = sources[cfg.key];
-    lines.push('');
-    lines.push(`${cfg.label.toUpperCase()}  —  ${cfg.sublabel}`);
-    lines.push(`Points per ${cfg.actionLabel}: ${points[cfg.pointsKey] ?? 0}`);
-    if (!src || !src.selectedColumn) {
-      lines.push('  (No file uploaded yet — mappings will appear here once you import one.)');
-      continue;
-    }
-    lines.push(`  Name column:   "${src.selectedColumn}"`);
-    lines.push(`  Count column:  ${src.countColumn ? `Sum of "${src.countColumn}"` : '1 per row (log file)'}`);
-    lines.push(`  Date column:   ${src.dateColumn ? `"${src.dateColumn}"` : '(none — excluded from Weekly Trends)'}`);
-  }
-
-  lines.push('');
-  lines.push('─'.repeat(60));
-  lines.push('');
-  lines.push('WHEN UPLOADING NEXT MONTH:');
-  lines.push(' 1. Use the same export format and column layout.');
-  lines.push(' 2. If columns are renamed, re-verify the three mappings above');
-  lines.push('    (Name, Count, Date) in each upload card.');
-  lines.push(' 3. If your Calendly Question/Response pairs change position,');
-  lines.push('    the case-number and district duplicate-detection still works');
-  lines.push('    — we scan all five Question slots regardless of order.');
-  lines.push(' 4. Zoom Phone "Time Range" summary files that lack per-row');
-  lines.push('    dates will be placed on the timeline using the preamble');
-  lines.push('    date only — for best timeline accuracy, upload daily files.');
-
-  return lines.join('\n');
-}
 
 /* ---------------- Calendly ↔ Zoom deduplication ----------------
  * Many Calendly bookings create a Zoom meeting automatically, so the same
@@ -1074,6 +1025,68 @@ function parseFile(file, hints = []) {
   });
 }
 
+/* ---------------- Repo-hosted data loading ----------------
+ * In production, data isn't uploaded — it lives alongside this HTML in the
+ * repo. On load, we fetch each source file, parse it, and populate state.
+ *
+ * To update data: replace the files in the /data folder and commit/push.
+ * Filenames are fixed so you don't have to touch code each week.
+ */
+const REPO_DATA_FILES = {
+  salesforce: 'data/cases.xlsx',
+  zoom:       'data/meetings.csv',
+  zoomPhone:  'data/agent-performance.xlsx',
+  calendly:   'data/events-export.csv'
+};
+
+/**
+ * Fetch a file from the same origin, parse it, and return parsed results.
+ * Mirrors parseFile() but works from a URL instead of a File object.
+ * Throws if the file is missing (404) or fails to parse.
+ */
+async function fetchAndParseFile(url, hints = []) {
+  const response = await fetch(url, { cache: 'no-cache' });
+  if (!response.ok) {
+    throw new Error(`File not found (HTTP ${response.status}): ${url}`);
+  }
+  const extension = url.toLowerCase().split('.').pop();
+
+  if (extension === 'csv' || extension === 'tsv' || extension === 'txt') {
+    const text = await response.text();
+    return new Promise((resolve, reject) => {
+      Papa.parse(text, {
+        header: false,
+        skipEmptyLines: true,
+        complete: (results) => {
+          try {
+            resolve(rowsToObjects(results.data || [], hints));
+          } catch (err) {
+            reject(err);
+          }
+        },
+        error: reject
+      });
+    });
+  }
+
+  if (extension === 'xlsx' || extension === 'xls' || extension === 'xlsm') {
+    const buffer = await response.arrayBuffer();
+    const data = new Uint8Array(buffer);
+    const workbook = XLSX.read(data, { type: 'array', cellDates: true });
+    const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+    if (!firstSheet) return { columns: [], rows: [], fallbackDate: null };
+    const rawRows = XLSX.utils.sheet_to_json(firstSheet, {
+      header: 1,
+      defval: '',
+      raw: false,
+      blankrows: false
+    });
+    return rowsToObjects(rawRows, hints);
+  }
+
+  throw new Error(`Unsupported file type: ${extension}`);
+}
+
 function countByColumn(rows, column, countColumn, skipIndices) {
   // Returns: { [nameKey]: { count, names: [originalName, ...] } }
   // When countColumn is provided, each row contributes the numeric value from that
@@ -1203,41 +1216,120 @@ function PanelTitle({ icon: Icon, title, subtitle, right }) {
   );
 }
 
-/* ---------------- Authentication (Google Sign-In) ---------------- */
+/* ---------------- Authentication (Password Gate) ----------------
+ * The app is gated by a single shared password. We store only the SHA-256
+ * hash in code — never the plaintext — so viewing this file's source doesn't
+ * reveal the password directly.
+ *
+ * IMPORTANT CAVEAT: this is client-side gating. A determined attacker can
+ * still brute-force the hash (especially with a wordlist), step through
+ * the code in devtools, or just edit the `unlocked` flag in localStorage to
+ * bypass the check. Use this as a "keep out" signal for casual users — not
+ * a real security boundary. For that you'd need a server.
+ *
+ * To change the password:
+ *   1. In a terminal run:
+ *        echo -n "YourNewPassword" | shasum -a 256
+ *      (on Linux: `sha256sum`)
+ *   2. Paste the resulting hex string into PASSWORD_HASH below.
+ */
+const PASSWORD_HASH = '7421083fc5e5db7f3ecd206c9c41b19ec8837770b33c496a3d64cc1487aabe47';
 
-// OAuth Client ID from the Google Cloud Console.
-// IMPORTANT: You must create an OAuth 2.0 Web Application client at
-// https://console.cloud.google.com/apis/credentials and paste the client ID here.
-// Add your deployment URL (and http://localhost:PORT for local dev) to the list
-// of "Authorized JavaScript origins" in that client configuration.
-const GOOGLE_CLIENT_ID = 'YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com';
+// Pure-JS SHA-256 implementation — fallback for when crypto.subtle is
+// unavailable (non-secure contexts, sandboxed iframe previews). Implements
+// FIPS 180-4. Verified against standard test vectors.
+const SHA256_K = [
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+];
 
-// Only allow accounts from this Google Workspace domain. The `hd` claim in the
-// ID token is set server-side by Google for Workspace accounts, so this is
-// the safe place to check domain membership (personal @gmail.com accounts
-// don't have an `hd` claim at all).
-const ALLOWED_GOOGLE_DOMAIN = 'classlink.com';
-
-// Decodes the payload of a Google ID token (JWT) without verifying signature.
-// This is safe for client-side domain gating because the ID token was obtained
-// directly from Google via the GIS library — we only use the `hd` claim to
-// decide what to show. Any real security would happen server-side.
-function decodeJwtPayload(token) {
-  try {
-    const parts = token.split('.');
-    if (parts.length !== 3) return null;
-    // Base64url → base64 → decoded bytes → UTF-8 string
-    const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(parts[1].length / 4) * 4, '=');
-    const json = decodeURIComponent(
-      atob(base64)
-        .split('')
-        .map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
-        .join('')
-    );
-    return JSON.parse(json);
-  } catch {
-    return null;
+function sha256HexPure(message) {
+  // UTF-8 encode input to a byte array
+  const bytes = [];
+  for (let i = 0; i < message.length; i++) {
+    let code = message.charCodeAt(i);
+    if (code < 0x80) bytes.push(code);
+    else if (code < 0x800) bytes.push(0xc0 | (code >>> 6), 0x80 | (code & 0x3f));
+    else if (code < 0xd800 || code >= 0xe000) bytes.push(0xe0 | (code >>> 12), 0x80 | ((code >>> 6) & 0x3f), 0x80 | (code & 0x3f));
+    else {
+      i++;
+      code = 0x10000 + (((code & 0x3ff) << 10) | (message.charCodeAt(i) & 0x3ff));
+      bytes.push(0xf0 | (code >>> 18), 0x80 | ((code >>> 12) & 0x3f), 0x80 | ((code >>> 6) & 0x3f), 0x80 | (code & 0x3f));
+    }
   }
+
+  // Pad: append 0x80, zero-pad to 56 mod 64, then append 64-bit big-endian length in bits
+  const origBitLen = bytes.length * 8;
+  bytes.push(0x80);
+  while ((bytes.length % 64) !== 56) bytes.push(0);
+  // high 32 bits of length (always 0 for reasonable inputs)
+  bytes.push(0, 0, 0, 0);
+  // low 32 bits of length (big-endian)
+  bytes.push((origBitLen >>> 24) & 0xff, (origBitLen >>> 16) & 0xff, (origBitLen >>> 8) & 0xff, origBitLen & 0xff);
+
+  // Initial hash values
+  let h0 = 0x6a09e667 | 0, h1 = 0xbb67ae85 | 0, h2 = 0x3c6ef372 | 0, h3 = 0xa54ff53a | 0;
+  let h4 = 0x510e527f | 0, h5 = 0x9b05688c | 0, h6 = 0x1f83d9ab | 0, h7 = 0x5be0cd19 | 0;
+
+  const w = new Array(64);
+
+  // Process each 512-bit block
+  for (let chunk = 0; chunk < bytes.length; chunk += 64) {
+    // Load 16 big-endian words
+    for (let i = 0; i < 16; i++) {
+      const o = chunk + i * 4;
+      w[i] = ((bytes[o] << 24) | (bytes[o + 1] << 16) | (bytes[o + 2] << 8) | bytes[o + 3]) | 0;
+    }
+    // Extend to 64 words
+    for (let i = 16; i < 64; i++) {
+      const x = w[i - 15];
+      const s0 = ((x >>> 7) | (x << 25)) ^ ((x >>> 18) | (x << 14)) ^ (x >>> 3);
+      const y = w[i - 2];
+      const s1 = ((y >>> 17) | (y << 15)) ^ ((y >>> 19) | (y << 13)) ^ (y >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+    }
+    // Compression
+    let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+    for (let i = 0; i < 64; i++) {
+      const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + SHA256_K[i] + w[i]) | 0;
+      const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+      const mj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + mj) | 0;
+      h = g; g = f; f = e; e = (d + t1) | 0;
+      d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0;
+    h4 = (h4 + e) | 0; h5 = (h5 + f) | 0; h6 = (h6 + g) | 0; h7 = (h7 + h) | 0;
+  }
+
+  const toHex = (x) => ((x >>> 0).toString(16).padStart(8, '0'));
+  return toHex(h0) + toHex(h1) + toHex(h2) + toHex(h3) + toHex(h4) + toHex(h5) + toHex(h6) + toHex(h7);
+}
+
+// SHA-256 with automatic fallback. Prefers the native browser API
+// (crypto.subtle.digest), falls back to the pure-JS implementation when
+// the native API is unavailable (e.g., sandboxed iframe previews).
+async function sha256Hex(text) {
+  try {
+    if (typeof crypto !== 'undefined' && crypto.subtle && crypto.subtle.digest) {
+      const buf = new TextEncoder().encode(text);
+      const hash = await crypto.subtle.digest('SHA-256', buf);
+      return Array.from(new Uint8Array(hash))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+    }
+  } catch {
+    // Fall through to pure-JS implementation
+  }
+  return sha256HexPure(text);
 }
 
 /* ---------------- Persistence ---------------- */
@@ -1246,7 +1338,7 @@ const STORAGE_KEYS = {
   sources: 'tally_v1_sources',
   points:  'tally_v1_points',
   activePage: 'tally_v1_activePage',
-  user: 'tally_v1_user'
+  unlocked: 'tally_v1_unlocked'
 };
 
 const safeStorage = {
@@ -1275,10 +1367,10 @@ const safeStorage = {
 };
 
 const DEFAULT_SOURCES = {
-  salesforce: { fileName: null, columns: [], rows: [], selectedColumn: null, countColumn: null, dateColumn: null, error: null },
-  zoom:       { fileName: null, columns: [], rows: [], selectedColumn: null, countColumn: null, dateColumn: null, error: null },
-  zoomPhone:  { fileName: null, columns: [], rows: [], selectedColumn: null, countColumn: null, dateColumn: null, error: null },
-  calendly:   { fileName: null, columns: [], rows: [], selectedColumn: null, countColumn: null, dateColumn: null, error: null }
+  salesforce: { columns: [], rows: [], selectedColumn: null, countColumn: null, dateColumn: null, status: 'pending', error: null },
+  zoom:       { columns: [], rows: [], selectedColumn: null, countColumn: null, dateColumn: null, status: 'pending', error: null },
+  zoomPhone:  { columns: [], rows: [], selectedColumn: null, countColumn: null, dateColumn: null, status: 'pending', error: null },
+  calendly:   { columns: [], rows: [], selectedColumn: null, countColumn: null, dateColumn: null, status: 'pending', error: null }
 };
 
 const DEFAULT_POINTS = {
@@ -1287,34 +1379,6 @@ const DEFAULT_POINTS = {
   zoomPhoneCall: 5,
   calendlyMeeting: 10
 };
-
-function loadSourcesFromStorage() {
-  const raw = safeStorage.get(STORAGE_KEYS.sources);
-  if (!raw) return DEFAULT_SOURCES;
-  try {
-    const parsed = JSON.parse(raw);
-    // Shape validation — fall back to defaults if anything looks off
-    if (!parsed || typeof parsed !== 'object') return DEFAULT_SOURCES;
-    const result = { ...DEFAULT_SOURCES };
-    for (const key of Object.keys(DEFAULT_SOURCES)) {
-      const s = parsed[key];
-      if (s && typeof s === 'object' && Array.isArray(s.rows) && Array.isArray(s.columns)) {
-        result[key] = {
-          fileName: s.fileName ?? null,
-          columns: s.columns,
-          rows: s.rows,
-          selectedColumn: s.selectedColumn ?? null,
-          countColumn: s.countColumn ?? null,
-          dateColumn: s.dateColumn ?? null,
-          error: null // never persist errors
-        };
-      }
-    }
-    return result;
-  } catch {
-    return DEFAULT_SOURCES;
-  }
-}
 
 function loadPointsFromStorage() {
   const raw = safeStorage.get(STORAGE_KEYS.points);
@@ -1348,38 +1412,90 @@ function GamificationDashboard() {
     calendly: calendlyInputRef
   };
 
-  // For each source: fileName, columns, rows, selectedColumn, error
-  const [sources, setSources] = useState(() => loadSourcesFromStorage());
+  // Source data — fetched from the repo's /data folder on mount.
+  // Not persisted to localStorage: we always pull the freshest files.
+  const [sources, setSources] = useState(DEFAULT_SOURCES);
 
   const [points, setPoints] = useState(() => loadPointsFromStorage());
 
-  // Currently signed-in user — null means the sign-in gate should show.
-  // Persisted in localStorage so sign-in sticks across refreshes.
-  const [user, setUser] = useState(() => {
-    const stored = safeStorage.get(STORAGE_KEYS.user);
-    if (!stored) return null;
-    try { return JSON.parse(stored); }
-    catch { return null; }
+  // Password gate state — true once the right password has been entered.
+  // Persisted in localStorage so the gate only appears on first use per device.
+  const [unlocked, setUnlocked] = useState(() => {
+    return safeStorage.get(STORAGE_KEYS.unlocked) === '1';
   });
 
-  const handleSignIn = useCallback((userInfo) => {
-    setUser(userInfo);
-    safeStorage.set(STORAGE_KEYS.user, JSON.stringify(userInfo));
+  const handleUnlock = useCallback(() => {
+    setUnlocked(true);
+    safeStorage.set(STORAGE_KEYS.unlocked, '1');
   }, []);
 
-  const handleSignOut = useCallback(() => {
-    setUser(null);
-    safeStorage.remove(STORAGE_KEYS.user);
-    // Also revoke the Google session so the picker shows again next time
-    if (window.google?.accounts?.id) {
-      try { window.google.accounts.id.disableAutoSelect(); } catch {}
+  const handleLock = useCallback(() => {
+    setUnlocked(false);
+    safeStorage.remove(STORAGE_KEYS.unlocked);
+  }, []);
+
+  // Load each source file from the repo on mount.
+  // Also exposes a `reloadSources` function for the user to retry failed loads.
+  const loadAllSources = useCallback(() => {
+    // Mark everything as loading
+    setSources(prev => {
+      const next = { ...prev };
+      for (const key of Object.keys(REPO_DATA_FILES)) {
+        next[key] = { ...DEFAULT_SOURCES[key], status: 'loading' };
+      }
+      return next;
+    });
+
+    // Fire off all four fetches in parallel — each updates its own slice on
+    // completion so the UI can show per-source status instead of waiting
+    // for the slowest file.
+    for (const sourceKey of Object.keys(REPO_DATA_FILES)) {
+      const cfg = SOURCE_CONFIG[sourceKey];
+      const url = REPO_DATA_FILES[sourceKey];
+      const allHints = [
+        ...cfg.nameHints,
+        ...cfg.previewHints,
+        ...(cfg.countColumnHints || []),
+        ...(cfg.dateColumnHints || [])
+      ];
+      fetchAndParseFile(url, allHints)
+        .then(({ columns, rows }) => {
+          if (columns.length === 0) {
+            throw new Error(`${url} has no recognizable header row.`);
+          }
+          const selected = autoDetectNameColumn(columns, cfg.nameHints);
+          const detectedCount = autoDetectCountColumn(columns, cfg.countColumnHints || [], rows, selected);
+          const detectedDate = autoDetectDateColumn(columns, cfg.dateColumnHints || []);
+          setSources(prev => ({
+            ...prev,
+            [sourceKey]: {
+              columns, rows,
+              selectedColumn: selected,
+              countColumn: detectedCount,
+              dateColumn: detectedDate,
+              status: 'loaded',
+              error: null
+            }
+          }));
+        })
+        .catch(err => {
+          setSources(prev => ({
+            ...prev,
+            [sourceKey]: {
+              ...DEFAULT_SOURCES[sourceKey],
+              status: 'error',
+              error: err.message || 'Failed to load'
+            }
+          }));
+        });
     }
   }, []);
 
-  // Persist on change
   useEffect(() => {
-    safeStorage.set(STORAGE_KEYS.sources, JSON.stringify(sources));
-  }, [sources]);
+    // Only auto-load once the user is past the password gate. Loading data
+    // before that would needlessly hit the repo while the gate is shown.
+    if (unlocked) loadAllSources();
+  }, [unlocked, loadAllSources]);
 
   useEffect(() => {
     safeStorage.set(STORAGE_KEYS.points, JSON.stringify(points));
@@ -1393,7 +1509,7 @@ function GamificationDashboard() {
   // Navigation between pages
   const [activePage, setActivePage] = useState(() => {
     const stored = safeStorage.get(STORAGE_KEYS.activePage);
-    return ['overview', 'team', 'trends', 'duplicates', 'sf_bonus', 'import'].includes(stored) ? stored : 'overview';
+    return ['overview', 'team', 'trends', 'duplicates', 'sf_bonus'].includes(stored) ? stored : 'overview';
   });
   useEffect(() => {
     safeStorage.set(STORAGE_KEYS.activePage, activePage);
@@ -1402,10 +1518,6 @@ function GamificationDashboard() {
     setActivePage(page);
     setSelectedPerson(null);
   };
-
-  // Which upload card is currently showing its delete-confirmation state.
-  // Holds a sourceKey ('salesforce' | 'zoom' | 'zoomPhone' | 'calendly') or null.
-  const [confirmingDeleteKey, setConfirmingDeleteKey] = useState(null);
 
   const onPersonClick = (e, person) => {
     // Find the name anchor within the row for positioning (falls back to row rect)
@@ -1444,205 +1556,18 @@ function GamificationDashboard() {
     return () => window.removeEventListener('keydown', onKey);
   }, [selectedPerson]);
 
-  /* --------- File upload handling --------- */
 
-  const handleFile = useCallback((sourceKey, file) => {
-    if (!file) return;
-    const cfg = SOURCE_CONFIG[sourceKey];
-    const allHints = [
-      ...cfg.nameHints,
-      ...cfg.previewHints,
-      ...(cfg.countColumnHints || []),
-      ...(cfg.dateColumnHints || [])
-    ];
-    parseFile(file, allHints)
-      .then(({ columns, rows }) => {
-        if (columns.length === 0) {
-          throw new Error("Couldn't find a header row with recognizable columns.");
-        }
-        const selected = autoDetectNameColumn(columns, cfg.nameHints);
-        const detectedCount = autoDetectCountColumn(
-          columns, cfg.countColumnHints || [], rows, selected
-        );
-        const detectedDate = autoDetectDateColumn(columns, cfg.dateColumnHints || []);
-        setSources(prev => ({
-          ...prev,
-          [sourceKey]: {
-            fileName: file.name,
-            columns,
-            rows,
-            selectedColumn: selected,
-            countColumn: detectedCount,
-            dateColumn: detectedDate,
-            error: null
-          }
-        }));
-      })
-      .catch(err => {
-        setSources(prev => ({
-          ...prev,
-          [sourceKey]: {
-            fileName: file.name,
-            columns: [],
-            rows: [],
-            selectedColumn: null,
-            countColumn: null,
-            dateColumn: null,
-            error: err.message || 'Failed to parse file'
-          }
-        }));
-      });
-  }, []);
+  /* --------- Data refresh --------- */
 
-  const clearSource = (sourceKey) => {
-    setSources(prev => ({
-      ...prev,
-      [sourceKey]: { fileName: null, columns: [], rows: [], selectedColumn: null, countColumn: null, dateColumn: null, error: null }
-    }));
-  };
+  // Expose a manual reload (for the "Refresh data" button in the sidebar)
+  const reloadSources = useCallback(() => {
+    loadAllSources();
+  }, [loadAllSources]);
 
-  const loadSampleData = () => {
-    // Pools of realistic-looking preview values
-    const zoomTopics = [
-      'ClassLink Annual Review',
-      'Engagement Strategic Planning Meeting',
-      'Product Support Call - 30 Minutes',
-      'ClassLink Overview / Demo',
-      'AD Connector Update Support',
-      'Roster Server Config Session',
-      'Implementation Kickoff',
-      'QBR - Q2 Check-in',
-      'Technical Deep Dive',
-      'Onboarding Walk-through'
-    ];
-    const sfSubjects = [
-      'SSO login not working for students',
-      'Roster sync failing nightly',
-      'Password reset flow broken',
-      'MFA enrollment issue',
-      'Dashboard loading slowly',
-      'LTI integration help needed',
-      'Add new admin user request',
-      'App tile icons missing'
-    ];
-    const sfStatuses = ['New', 'In Progress', 'Escalated', 'Waiting', 'Resolved'];
-    const directions = ['Inbound', 'Outbound'];
-    const calendlyTypes = [
-      '30 Minute Meeting', '15 Minute Call', 'Discovery Call',
-      'Product Demo', 'Strategic Review', 'Support Session'
-    ];
-    const invitees = [
-      'alex.admin@district.edu', 'taylor.it@schools.org',
-      'jordan.coord@academy.net', 'casey.dir@k12.us',
-      'morgan.super@edu.gov', 'riley.tech@district.edu'
-    ];
-
-    const pick = (arr, i) => arr[i % arr.length];
-    const fmtDate = (daysAgo, hour, min) => {
-      const d = new Date();
-      d.setDate(d.getDate() - daysAgo);
-      d.setHours(hour, min, 0, 0);
-      return d.toLocaleString('en-US', {
-        month: 'numeric', day: 'numeric', year: 'numeric',
-        hour: 'numeric', minute: '2-digit'
-      });
-    };
-    // Sample data spans ~4 weeks so the Trends chart has multiple points per person
-    const daysAgoFor = (i) => (i * 3) % 28;
-
-    // Build richer rows for each source (not just the name column)
-    const buildSalesforceRows = () =>
-      SAMPLE_TEAM.flatMap(([name, count]) =>
-        Array.from({ length: count }, (_, i) => ({
-          'Case Number': `000${75000 + Math.floor(Math.random() * 9999)}`,
-          'Subject': pick(sfSubjects, i + name.length),
-          'Case Owner': name,
-          'Date/Time Opened': fmtDate(daysAgoFor(i + name.length), 9 + (i % 8), (i * 7) % 60),
-          'Status': pick(sfStatuses, i + name.length)
-        }))
-      );
-
-    const buildZoomRows = () =>
-      SAMPLE_TEAM.flatMap(([name, , count]) =>
-        Array.from({ length: count }, (_, i) => {
-          const start = fmtDate(daysAgoFor(i + name.length), 9 + (i % 8), (i * 7) % 60);
-          const endH = String(10 + ((i + 1) % 8));
-          const endM = String(((i * 7 + 30) % 60)).padStart(2, '0');
-          return {
-            'Meeting ID': `${800 + i} ${1000 + i * 3} ${2000 + i}`,
-            'Topic': pick(zoomTopics, i + name.length),
-            'Host': name,
-            'Start Time': start,
-            'End Time': `${endH}:${endM} ${i % 2 ? 'PM' : 'AM'}`
-          };
-        })
-      );
-
-    const buildCalendlyRows = () =>
-      SAMPLE_TEAM.flatMap(([name, , , count]) =>
-        Array.from({ length: count }, (_, i) => ({
-          'Event Type': pick(calendlyTypes, i + name.length),
-          'Host Name': name,
-          'Invitee': pick(invitees, i + name.length),
-          'Event Date': fmtDate(daysAgoFor(i + name.length), 10 + (i % 6), 0)
-        }))
-      );
-
-    const buildPhoneRows = () =>
-      SAMPLE_TEAM.flatMap(([name, , , , count]) =>
-        Array.from({ length: count }, (_, i) => ({
-          'Call ID': `CALL-${10000 + i}-${name.length}`,
-          'User Name': name,
-          'Direction': pick(directions, i),
-          'Duration': `${Math.floor(Math.random() * 12) + 1}m ${Math.floor(Math.random() * 60)}s`,
-          'Date': fmtDate(daysAgoFor(i + name.length), 8 + (i % 10), (i * 3) % 60)
-        }))
-      );
-
-    setSources({
-      salesforce: {
-        fileName: 'sample_salesforce_cases.csv',
-        columns: ['Case Number', 'Subject', 'Case Owner', 'Date/Time Opened', 'Status'],
-        rows: buildSalesforceRows(),
-        selectedColumn: 'Case Owner',
-        countColumn: null,
-        dateColumn: 'Date/Time Opened',
-        error: null
-      },
-      zoom: {
-        fileName: 'sample_zoom_meetings.xlsx',
-        columns: ['Meeting ID', 'Topic', 'Host', 'Start Time', 'End Time'],
-        rows: buildZoomRows(),
-        selectedColumn: 'Host',
-        countColumn: null,
-        dateColumn: 'Start Time',
-        error: null
-      },
-      zoomPhone: {
-        fileName: 'sample_zoom_phone_calls.csv',
-        columns: ['Call ID', 'User Name', 'Direction', 'Duration', 'Date'],
-        rows: buildPhoneRows(),
-        selectedColumn: 'User Name',
-        countColumn: null,
-        dateColumn: 'Date',
-        error: null
-      },
-      calendly: {
-        fileName: 'sample_calendly_events.csv',
-        columns: ['Event Type', 'Host Name', 'Invitee', 'Event Date'],
-        rows: buildCalendlyRows(),
-        selectedColumn: 'Host Name',
-        countColumn: null,
-        dateColumn: 'Event Date',
-        error: null
-      }
-    });
-  };
-
-  const resetAll = () => {
-    setSources(DEFAULT_SOURCES);
+  // Reset only rescales per-user preferences (point values). Source data
+  // always re-fetches from the repo on load, so it doesn't need resetting.
+  const resetPoints = () => {
     setPoints(DEFAULT_POINTS);
-    safeStorage.remove(STORAGE_KEYS.sources);
     safeStorage.remove(STORAGE_KEYS.points);
   };
 
@@ -1793,6 +1718,17 @@ function GamificationDashboard() {
   const hasData = people.length > 0;
   const topPerformer = people[0];
 
+  // Aggregate source-loading status for empty-state rendering
+  const sourceStatuses = Object.keys(REPO_DATA_FILES).map(k => ({
+    key: k,
+    label: SOURCE_CONFIG[k].label,
+    url: REPO_DATA_FILES[k],
+    ...sources[k]
+  }));
+  const anyLoading = sourceStatuses.some(s => s.status === 'loading' || s.status === 'pending');
+  const allErrored = sourceStatuses.every(s => s.status === 'error');
+  const someErrored = sourceStatuses.some(s => s.status === 'error');
+
   // Weekly cumulative points per person — for the Trends page
   // Returns: { weeks: [{key, label}, ...], series: [{ key, name, color, points: { [weekKey]: cumulative } }, ...] }
   const weeklyTrends = useMemo(() => {
@@ -1906,9 +1842,9 @@ function GamificationDashboard() {
 
   /* ---------------- Render ---------------- */
 
-  // Block access to the app until a valid @classlink.com user is signed in
-  if (!user) {
-    return <SignInGate onSignIn={handleSignIn} />;
+  // Block access until the correct password has been entered
+  if (!unlocked) {
+    return <PasswordGate onUnlock={handleUnlock} />;
   }
 
   return (
@@ -2171,13 +2107,6 @@ function GamificationDashboard() {
             <Flame size={16} />
             Bonus tickets
           </button>
-          <button
-            className={`nav-item ${activePage === 'import' ? 'active' : ''}`}
-            onClick={() => onNavigate('import')}
-          >
-            <Upload size={16} />
-            Import data
-          </button>
         </nav>
 
         {/* Spacer */}
@@ -2185,44 +2114,6 @@ function GamificationDashboard() {
 
         {/* Sidebar footer — status + actions */}
         <div className="px-5 pb-5 pt-4" style={{ borderTop: '1px solid var(--border-soft)' }}>
-          {/* Signed-in user strip */}
-          <div
-            className="flex items-center gap-2.5 px-2 py-2 rounded-lg mb-3"
-            style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid var(--border-soft)' }}
-          >
-            {user.picture ? (
-              <img
-                src={user.picture}
-                alt=""
-                className="w-7 h-7 rounded-full flex-shrink-0"
-                referrerPolicy="no-referrer"
-                style={{ border: '1px solid rgba(255,255,255,0.08)' }}
-              />
-            ) : (
-              <div
-                className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 mono text-[11px]"
-                style={{ background: 'rgba(96,165,250,0.12)', color: '#60A5FA', border: '1px solid rgba(96,165,250,0.25)' }}
-              >
-                {(user.name || user.email || '?').slice(0, 1).toUpperCase()}
-              </div>
-            )}
-            <div className="flex-1 min-w-0">
-              <div className="text-[11.5px] font-medium truncate" title={user.name}>
-                {user.name || user.email}
-              </div>
-              <div className="text-[10px] truncate" style={{ color: '#71717A' }} title={user.email}>
-                {user.email}
-              </div>
-            </div>
-            <button
-              className="btn-ghost btn p-1.5 flex-shrink-0"
-              onClick={handleSignOut}
-              title="Sign out"
-            >
-              <X size={13} style={{ color: '#71717A' }} />
-            </button>
-          </div>
-
           {hasData && topPerformer && (
             <div className="panel-inset px-3 py-2.5 mb-3">
               <div className="text-[9px] uppercase tracking-[0.2em]" style={{ color: '#52525B' }}>
@@ -2238,18 +2129,23 @@ function GamificationDashboard() {
               </div>
             </div>
           )}
-          {!hasData ? (
-            <button className="btn btn-primary w-full justify-center" onClick={loadSampleData}>
-              <Sparkles size={13} /> Load sample
-            </button>
-          ) : (
-            <button className="btn w-full justify-center" onClick={resetAll}>
-              <RefreshCw size={13} /> Reset all
-            </button>
-          )}
+          <button
+            className="btn w-full justify-center"
+            onClick={reloadSources}
+            title="Re-fetch data files from the repo"
+          >
+            <RefreshCw size={13} /> Refresh data
+          </button>
+          <button
+            className="btn w-full justify-center mt-2"
+            onClick={handleLock}
+            title="Require the password again on this device"
+          >
+            <X size={13} /> Lock
+          </button>
           <div className="flex items-center gap-2 mt-3 text-[10px]" style={{ color: '#52525B' }}>
             <span className="w-1.5 h-1.5 rounded-full" style={{ background: '#60A5FA' }} />
-            <span>Saved locally</span>
+            <span>Data from repo · /data folder</span>
           </div>
         </div>
       </aside>
@@ -2277,7 +2173,6 @@ function GamificationDashboard() {
             {activePage === 'trends' && 'Timeline'}
             {activePage === 'duplicates' && 'Audit'}
             {activePage === 'sf_bonus' && 'Audit'}
-            {activePage === 'import' && 'Data'}
           </div>
           <h1 className="text-[36px] md:text-[44px] leading-[1.05] font-medium tracking-tight mt-1.5">
             {activePage === 'overview' && (
@@ -2295,9 +2190,6 @@ function GamificationDashboard() {
             {activePage === 'sf_bonus' && (
               <>Tickets that <span className="serif italic" style={{ color: '#60A5FA' }}>earned more</span>.</>
             )}
-            {activePage === 'import' && (
-              <>Drop in your <span className="serif italic" style={{ color: '#60A5FA' }}>exports</span>.</>
-            )}
           </h1>
         </header>
 
@@ -2310,355 +2202,7 @@ function GamificationDashboard() {
         )}
 
         {/* ===================================================== */}
-        {/* ============== IMPORT PAGE ========================== */}
-        {/* ===================================================== */}
-        {activePage === 'import' && (
-          <>
-            {/* Upload zones */}
-            <section className="mb-10">
-          <PanelTitle
-            icon={Upload}
-            subtitle="Step 01"
-            title="Import reports"
-            right={
-              <div className="chip">
-                <span>CSV · XLSX</span>
-              </div>
-            }
-          />
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            {Object.values(SOURCE_CONFIG).map(cfg => {
-              const src = sources[cfg.key];
-              const loaded = src.fileName !== null && src.error === null;
-              const errored = src.error !== null;
-              const Icon = cfg.icon;
-              const rowCount = src.rows.length;
-              const previewCols = loaded
-                ? findPreviewColumns(src.columns, cfg.previewHints, src.selectedColumn, src.countColumn)
-                : [];
-              const previewRows = loaded ? src.rows.slice(0, 3) : [];
-              // When a count column is set, total actions = sum of count values across rows
-              const actionTotal = loaded && src.countColumn
-                ? src.rows.reduce((s, r) => {
-                    const v = r[src.countColumn];
-                    const n = typeof v === 'number' ? v : parseFloat(String(v || '').replace(/,/g, ''));
-                    return s + (isNaN(n) ? 0 : Math.max(0, Math.round(n)));
-                  }, 0)
-                : rowCount;
-              return (
-                <div key={cfg.key} className={`upload-zone p-5 ${loaded ? 'loaded' : ''} ${errored ? 'errored' : ''}`}>
-                  <div className="flex items-start justify-between mb-4">
-                    <div className="flex items-center gap-3">
-                      <div
-                        className="w-10 h-10 rounded-lg flex items-center justify-center"
-                        style={{ background: cfg.accentSoft, border: `1px solid ${cfg.accent}33` }}
-                      >
-                        <Icon size={18} style={{ color: cfg.accent }} />
-                      </div>
-                      <div>
-                        <div className="font-medium text-[14px]">{cfg.label}</div>
-                        <div className="text-[11px]" style={{ color: '#71717A' }}>{cfg.sublabel}</div>
-                      </div>
-                    </div>
-                    {(loaded || errored) && (
-                      confirmingDeleteKey === cfg.key ? (
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            className="btn px-2 py-1 text-[10.5px] uppercase tracking-wider"
-                            onClick={() => setConfirmingDeleteKey(null)}
-                            title="Keep this file"
-                          >
-                            Cancel
-                          </button>
-                          <button
-                            className="btn px-2 py-1 text-[10.5px] uppercase tracking-wider"
-                            style={{ background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.4)', color: '#FCA5A5' }}
-                            onClick={() => { clearSource(cfg.key); setConfirmingDeleteKey(null); }}
-                            title="Permanently remove this file"
-                          >
-                            Delete
-                          </button>
-                        </div>
-                      ) : (
-                        <button
-                          className="btn-ghost btn p-1.5"
-                          onClick={() => setConfirmingDeleteKey(cfg.key)}
-                          title="Remove this file"
-                        >
-                          <X size={14} style={{ color: '#71717A' }} />
-                        </button>
-                      )
-                    )}
-                  </div>
-
-                  {errored ? (
-                    <div className="space-y-3">
-                      <div className="flex items-start gap-2 p-3 rounded-lg" style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)' }}>
-                        <AlertCircle size={14} style={{ color: '#F87171', marginTop: 2, flexShrink: 0 }} />
-                        <div className="text-[12px]" style={{ color: '#FCA5A5' }}>
-                          <div className="font-medium mb-0.5">Couldn't parse file</div>
-                          <div style={{ color: '#F87171' }}>{src.error}</div>
-                        </div>
-                      </div>
-                      <button className="btn w-full justify-center" onClick={() => fileInputs[cfg.key].current?.click()}>
-                        <Upload size={14} /> Try another file
-                      </button>
-                      <input
-                        ref={fileInputs[cfg.key]}
-                        type="file"
-                        accept=".csv,.tsv,.txt,.xlsx,.xls,.xlsm"
-                        className="hidden"
-                        onChange={(e) => handleFile(cfg.key, e.target.files[0])}
-                      />
-                    </div>
-                  ) : !loaded ? (
-                    <>
-                      <button
-                        onClick={() => fileInputs[cfg.key].current?.click()}
-                        className="w-full py-8 rounded-lg flex flex-col items-center justify-center gap-2 cursor-pointer transition-colors"
-                        style={{ color: '#71717A' }}
-                      >
-                        <FileSpreadsheet size={22} />
-                        <div className="text-[13px]">Drop CSV / XLSX</div>
-                        <div className="text-[11px]" style={{ color: '#52525B' }}>or click to browse</div>
-                      </button>
-                      <input
-                        ref={fileInputs[cfg.key]}
-                        type="file"
-                        accept=".csv,.tsv,.txt,.xlsx,.xls,.xlsm"
-                        className="hidden"
-                        onChange={(e) => handleFile(cfg.key, e.target.files[0])}
-                      />
-                    </>
-                  ) : (
-                    <div className="space-y-3">
-                      <div className="flex items-center gap-2 text-[12px]" style={{ color: '#A1A1AA' }}>
-                        <Check size={14} style={{ color: '#60A5FA' }} />
-                        <span className="truncate flex-1" title={src.fileName}>{src.fileName}</span>
-                      </div>
-
-                      {/* Row count chip — shows actual action total when a count column is used */}
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="chip mono tabular">
-                          {actionTotal} {cfg.actionLabelPlural}
-                        </div>
-                        {src.countColumn && rowCount !== actionTotal && (
-                          <span className="text-[10px]" style={{ color: '#71717A' }}>
-                            {rowCount} {rowCount === 1 ? 'row' : 'rows'}
-                          </span>
-                        )}
-                      </div>
-
-                      {/* Name column selector */}
-                      <div>
-                        <div className="text-[9.5px] uppercase tracking-[0.18em] mb-1" style={{ color: '#52525B' }}>
-                          Name column
-                        </div>
-                        <select
-                          className="native w-full"
-                          value={src.selectedColumn || ''}
-                          onChange={(e) => setSources(prev => ({
-                            ...prev,
-                            [cfg.key]: { ...prev[cfg.key], selectedColumn: e.target.value }
-                          }))}
-                          title="Which column contains the person's name?"
-                        >
-                          {src.columns.map(col => (
-                            <option key={col} value={col}>{col}</option>
-                          ))}
-                        </select>
-                      </div>
-
-                      {/* Count-from selector — for summary/aggregated reports */}
-                      <div>
-                        <div className="text-[9.5px] uppercase tracking-[0.18em] mb-1 flex items-center justify-between" style={{ color: '#52525B' }}>
-                          <span>Count from</span>
-                          {src.countColumn && (
-                            <span style={{ color: cfg.accent }}>summary file</span>
-                          )}
-                        </div>
-                        <select
-                          className="native w-full"
-                          value={src.countColumn || '__rows__'}
-                          onChange={(e) => setSources(prev => ({
-                            ...prev,
-                            [cfg.key]: {
-                              ...prev[cfg.key],
-                              countColumn: e.target.value === '__rows__' ? null : e.target.value
-                            }
-                          }))}
-                          title="If each row is an aggregated total (like 'Handled: 27'), pick that column. Otherwise use '1 per row'."
-                        >
-                          <option value="__rows__">1 per row (log file)</option>
-                          {src.columns
-                            .filter(col => col !== src.selectedColumn)
-                            .map(col => (
-                              <option key={col} value={col}>Sum of "{col}"</option>
-                            ))
-                          }
-                        </select>
-                      </div>
-
-                      {/* Date-column selector — powers the Trends page */}
-                      <div>
-                        <div className="text-[9.5px] uppercase tracking-[0.18em] mb-1 flex items-center justify-between" style={{ color: '#52525B' }}>
-                          <span>Date column</span>
-                          {!src.dateColumn && (
-                            <span title="Without a date column, rows from this source won't appear on the Weekly Trends chart." style={{ color: '#F5B841' }}>no trend</span>
-                          )}
-                        </div>
-                        <select
-                          className="native w-full"
-                          value={src.dateColumn || '__none__'}
-                          onChange={(e) => setSources(prev => ({
-                            ...prev,
-                            [cfg.key]: {
-                              ...prev[cfg.key],
-                              dateColumn: e.target.value === '__none__' ? null : e.target.value
-                            }
-                          }))}
-                          title="Column with per-row dates. Used to bucket actions into weeks on the Trends page."
-                        >
-                          <option value="__none__">None (skip trend chart)</option>
-                          {src.columns
-                            .filter(col => col !== src.selectedColumn && col !== src.countColumn)
-                            .map(col => (
-                              <option key={col} value={col}>{col}</option>
-                            ))
-                          }
-                        </select>
-                      </div>
-
-                      {/* Mini preview of 3 recent rows */}
-                      {previewRows.length > 0 && (previewCols.length > 0 || src.countColumn) && (
-                        <div className="mt-4 pt-3" style={{ borderTop: '1px solid var(--border-soft)' }}>
-                          <div className="flex items-center justify-between mb-2">
-                            <span className="text-[9.5px] uppercase tracking-[0.2em]" style={{ color: '#52525B' }}>
-                              Preview
-                            </span>
-                            <span className="text-[9.5px] uppercase tracking-[0.18em] truncate ml-2" style={{ color: '#3F3F46' }}>
-                              {src.countColumn
-                                ? `${src.selectedColumn} · ${src.countColumn}`
-                                : previewCols.join(' · ')}
-                            </span>
-                          </div>
-                          <div className="space-y-1.5">
-                            {previewRows.map((row, i) => {
-                              // For summary files: show name + count prominently
-                              // For log files: show first preview col (e.g. Topic), then rest
-                              const primary = src.countColumn
-                                ? row[src.selectedColumn]
-                                : (previewCols[0] ? row[previewCols[0]] : null);
-                              const secondary = src.countColumn
-                                ? `${row[src.countColumn] || 0} ${cfg.actionLabelPlural}`
-                                : previewCols.slice(1).map(c => row[c]).filter(Boolean).join(' → ');
-                              return (
-                                <div key={i} className="text-[11px] leading-snug">
-                                  <div className="truncate" style={{ color: '#D4D4D8' }} title={String(primary || '')}>
-                                    {primary || <span style={{ color: '#3F3F46' }}>—</span>}
-                                  </div>
-                                  {secondary && (
-                                    <div className="truncate mono" style={{ color: '#71717A', fontSize: 10 }} title={secondary}>
-                                      {secondary}
-                                    </div>
-                                  )}
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </section>
-
-            {/* Import status summary */}
-            {hasData && (
-              <section className="panel p-6">
-                <PanelTitle
-                  icon={Check}
-                  subtitle="Status"
-                  title="What's imported"
-                />
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-                  {Object.values(SOURCE_CONFIG).map(cfg => {
-                    const src = sources[cfg.key];
-                    const Icon = cfg.icon;
-                    const count = src.rows.length;
-                    return (
-                      <div key={cfg.key} className="panel-inset px-4 py-3 flex items-center gap-3">
-                        <div
-                          className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0"
-                          style={{ background: cfg.accentSoft, border: `1px solid ${cfg.accent}33` }}
-                        >
-                          <Icon size={16} style={{ color: cfg.accent }} />
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="text-[12.5px] font-medium truncate">{cfg.label}</div>
-                          {count > 0 ? (
-                            <div className="text-[10.5px]" style={{ color: '#A1A1AA' }}>
-                              {count} {count === 1 ? cfg.actionLabel : cfg.actionLabelPlural}
-                            </div>
-                          ) : (
-                            <div className="text-[10.5px]" style={{ color: '#52525B' }}>
-                              Not imported
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </section>
-            )}
-
-            {/* Field-mapping instruction sheet — a record of the current
-                column choices so you can reproduce them on next month's upload */}
-            {Object.values(sources).some(s => s.selectedColumn) && (
-              <section className="panel p-6 mt-6">
-                <div className="flex items-start justify-between gap-4 mb-4">
-                  <div>
-                    <div className="text-[10.5px] uppercase tracking-[0.22em]" style={{ color: '#71717A' }}>
-                      Reference
-                    </div>
-                    <div className="text-[19px] font-medium mt-0.5">Current field mappings</div>
-                    <div className="text-[12px] mt-1" style={{ color: '#A1A1AA' }}>
-                      The dropdown selections currently set on each upload card. Keep this handy so next month's uploads use the same mappings.
-                    </div>
-                  </div>
-                  <button
-                    className="btn"
-                    onClick={() => {
-                      const text = buildMappingInstructions(sources, SOURCE_CONFIG, points);
-                      try {
-                        navigator.clipboard.writeText(text);
-                      } catch {}
-                    }}
-                    title="Copy as plain text"
-                  >
-                    <FileSpreadsheet size={14} /> Copy as text
-                  </button>
-                </div>
-                <pre
-                  className="text-[12px] leading-relaxed p-4 rounded-lg whitespace-pre-wrap"
-                  style={{
-                    background: 'rgba(255,255,255,0.02)',
-                    border: '1px solid var(--border-soft)',
-                    color: '#D4D4D8',
-                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
-                  }}
-                >
-                  {buildMappingInstructions(sources, SOURCE_CONFIG, points)}
-                </pre>
-              </section>
-            )}
-          </>
-        )}
 
         {/* ============== OVERVIEW PAGE (continued) ============ */}
         {activePage === 'overview' && (
@@ -2718,29 +2262,82 @@ function GamificationDashboard() {
               </div>
             </section>
 
-            {/* Empty state */}
+            {/* Empty / loading / error state */}
             {!hasData && (
-              <section className="panel p-12 text-center">
-                <div
-                  className="w-14 h-14 rounded-2xl mx-auto mb-5 flex items-center justify-center"
-                  style={{ background: 'rgba(96,165,250,0.08)', border: '1px solid rgba(96,165,250,0.2)' }}
-                >
-                  <BarChart3 size={26} style={{ color: '#60A5FA' }} />
-                </div>
-                <h3 className="text-[22px] font-medium mb-2">
-                  Waiting for <span className="serif italic" style={{ color: '#60A5FA' }}>data</span>
-                </h3>
-                <p className="text-[14px] max-w-md mx-auto mb-6" style={{ color: '#A1A1AA' }}>
-                  Upload CSV or XLSX exports from Salesforce, Zoom, or Calendly from the Import page — or load sample data to see how the scoreboard looks.
-                </p>
-                <div className="flex items-center justify-center gap-2">
-                  <button className="btn btn-primary" onClick={loadSampleData}>
-                    <Sparkles size={14} /> Load sample data
-                  </button>
-                  <button className="btn" onClick={() => onNavigate('import')}>
-                    <Upload size={14} /> Go to import
-                  </button>
-                </div>
+              <section className="panel p-10">
+                {anyLoading ? (
+                  <div className="text-center">
+                    <div
+                      className="w-14 h-14 rounded-2xl mx-auto mb-5 flex items-center justify-center"
+                      style={{ background: 'rgba(96,165,250,0.08)', border: '1px solid rgba(96,165,250,0.2)' }}
+                    >
+                      <RefreshCw size={24} style={{ color: '#60A5FA', animation: 'spin 1.2s linear infinite' }} />
+                    </div>
+                    <h3 className="text-[20px] font-medium mb-1">Loading data from the repo…</h3>
+                    <p className="text-[13px]" style={{ color: '#A1A1AA' }}>
+                      Fetching the four data files and building the scoreboard.
+                    </p>
+                    <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+                  </div>
+                ) : (
+                  <>
+                    <div className="text-center mb-5">
+                      <div
+                        className="w-14 h-14 rounded-2xl mx-auto mb-4 flex items-center justify-center"
+                        style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.22)' }}
+                      >
+                        <AlertCircle size={24} style={{ color: '#F87171' }} />
+                      </div>
+                      <h3 className="text-[20px] font-medium mb-1">
+                        {allErrored ? 'No data files found' : 'Some data files failed to load'}
+                      </h3>
+                      <p className="text-[13px] max-w-xl mx-auto" style={{ color: '#A1A1AA' }}>
+                        Tally reads its source files from a <span className="mono" style={{ color: '#D4D4D8' }}>/data</span> folder in the repo. Commit these files (exact filenames) to your repo and refresh.
+                      </p>
+                    </div>
+
+                    {/* Per-source status list */}
+                    <div className="max-w-xl mx-auto space-y-2 mb-6">
+                      {sourceStatuses.map(s => (
+                        <div
+                          key={s.key}
+                          className="flex items-center justify-between p-3 rounded-lg"
+                          style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid var(--border-soft)' }}
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <span
+                              className="w-1.5 h-1.5 rounded-full flex-shrink-0"
+                              style={{ background: s.status === 'loaded' ? '#22C55E' : (s.status === 'error' ? '#F87171' : '#60A5FA') }}
+                            />
+                            <div className="min-w-0">
+                              <div className="text-[12.5px] font-medium truncate">{s.label}</div>
+                              <div className="mono text-[10.5px] truncate" style={{ color: '#71717A' }} title={s.url}>
+                                {s.url}
+                              </div>
+                            </div>
+                          </div>
+                          <div className="text-[11px] flex-shrink-0 ml-3">
+                            {s.status === 'loaded' && (
+                              <span style={{ color: '#22C55E' }}>{s.rows.length} rows</span>
+                            )}
+                            {s.status === 'error' && (
+                              <span style={{ color: '#F87171' }} title={s.error}>Not found</span>
+                            )}
+                            {(s.status === 'loading' || s.status === 'pending') && (
+                              <span style={{ color: '#71717A' }}>Loading…</span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="flex items-center justify-center">
+                      <button className="btn" onClick={reloadSources}>
+                        <RefreshCw size={14} /> Retry
+                      </button>
+                    </div>
+                  </>
+                )}
               </section>
             )}
 
@@ -2952,22 +2549,19 @@ function GamificationDashboard() {
                   className="w-14 h-14 rounded-2xl mx-auto mb-5 flex items-center justify-center"
                   style={{ background: 'rgba(96,165,250,0.08)', border: '1px solid rgba(96,165,250,0.2)' }}
                 >
-                  <Users size={26} style={{ color: '#60A5FA' }} />
+                  {anyLoading
+                    ? <RefreshCw size={24} style={{ color: '#60A5FA', animation: 'spin 1.2s linear infinite' }} />
+                    : <Users size={26} style={{ color: '#60A5FA' }} />}
                 </div>
                 <h3 className="text-[22px] font-medium mb-2">
-                  No <span className="serif italic" style={{ color: '#60A5FA' }}>team members</span> yet
+                  {anyLoading ? 'Loading…' : <>No <span className="serif italic" style={{ color: '#60A5FA' }}>team members</span> yet</>}
                 </h3>
                 <p className="text-[14px] max-w-md mx-auto mb-6" style={{ color: '#A1A1AA' }}>
-                  Once you import data, everyone who appears in your exports will show up here with their full breakdown.
+                  {anyLoading
+                    ? 'Fetching source data from the repo.'
+                    : 'Source files haven\'t loaded yet. Check the Overview page for details.'}
                 </p>
-                <div className="flex items-center justify-center gap-2">
-                  <button className="btn btn-primary" onClick={loadSampleData}>
-                    <Sparkles size={14} /> Load sample data
-                  </button>
-                  <button className="btn" onClick={() => onNavigate('import')}>
-                    <Upload size={14} /> Go to import
-                  </button>
-                </div>
+                <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
               </section>
             ) : (
               <section className="panel p-6 mb-10">
@@ -3106,8 +2700,6 @@ function GamificationDashboard() {
           <TrendsPage
             hasData={hasData}
             weeklyTrends={weeklyTrends}
-            onLoadSample={loadSampleData}
-            onGoImport={() => onNavigate('import')}
           />
         )}
 
@@ -3125,7 +2717,6 @@ function GamificationDashboard() {
             zoomConfig={SOURCE_CONFIG.zoom}
             salesforceConfig={SOURCE_CONFIG.salesforce}
             sources={sources}
-            onGoImport={() => onNavigate('import')}
           />
         )}
 
@@ -3138,7 +2729,6 @@ function GamificationDashboard() {
             salesforceRows={sources.salesforce.rows}
             salesforceConfig={SOURCE_CONFIG.salesforce}
             hasSalesforce={sources.salesforce.rows.length > 0}
-            onGoImport={() => onNavigate('import')}
           />
         )}
 
@@ -3883,7 +3473,7 @@ function PersonBreakdownCard({
 }
 /* ---------- Sub-component: Weekly Trends page ---------- */
 
-function TrendsPage({ hasData, weeklyTrends, onLoadSample, onGoImport }) {
+function TrendsPage({ hasData, weeklyTrends }) {
   // Highlight one person on hover/click in the legend
   const [focusedKey, setFocusedKey] = useState(null);
 
@@ -3899,17 +3489,9 @@ function TrendsPage({ hasData, weeklyTrends, onLoadSample, onGoImport }) {
         <h3 className="text-[22px] font-medium mb-2">
           No <span className="serif italic" style={{ color: '#60A5FA' }}>trend data</span> yet
         </h3>
-        <p className="text-[14px] max-w-md mx-auto mb-6" style={{ color: '#A1A1AA' }}>
-          Upload monthly reports with date columns (e.g., "Date Opened", "Start Time") and the chart will plot each person's cumulative points by week.
+        <p className="text-[14px] max-w-md mx-auto" style={{ color: '#A1A1AA' }}>
+          Data is still loading — or the source files haven't been committed to the repo yet. Check the Overview page for details.
         </p>
-        <div className="flex items-center justify-center gap-2">
-          <button className="btn btn-primary" onClick={onLoadSample}>
-            <Sparkles size={14} /> Load sample data
-          </button>
-          <button className="btn" onClick={onGoImport}>
-            <Upload size={14} /> Go to import
-          </button>
-        </div>
       </section>
     );
   }
@@ -3928,16 +3510,13 @@ function TrendsPage({ hasData, weeklyTrends, onLoadSample, onGoImport }) {
           </div>
           <h3 className="text-[20px] font-medium mb-2">Couldn't find dated activity</h3>
           <p className="text-[13.5px] max-w-lg mx-auto mb-4" style={{ color: '#A1A1AA' }}>
-            None of your imported files have a date column detected. To see weekly trends, each source needs a column containing per-row dates (e.g., "Date Opened", "Start Time", "Start Date &amp; Time").
+            None of the loaded files have a detected date column. Each source needs a column containing per-row dates (e.g., "Date Opened", "Start Time", "Start Date &amp; Time").
           </p>
           {missingSources.length > 0 && (
             <p className="text-[12px]" style={{ color: '#71717A' }}>
               Missing dates for: <span style={{ color: '#F4F4F5' }}>{missingSources.join(', ')}</span>
             </p>
           )}
-          <button className="btn mt-5" onClick={onGoImport}>
-            <Upload size={14} /> Adjust imports
-          </button>
         </section>
       </>
     );
@@ -4113,7 +3692,7 @@ function DuplicatesPage({
   salesforceDetails,      // Salesforce→{Calendly|Zoom} match details
   calendlyRows, zoomRows, salesforceRows,
   calendlyConfig, zoomConfig, salesforceConfig,
-  sources, onGoImport
+  sources
 }) {
   // Modal state — one row inspected at a time
   const [inspectingRow, setInspectingRow] = useState(null);
@@ -4133,12 +3712,9 @@ function DuplicatesPage({
         <h3 className="text-[22px] font-medium mb-2">
           Nothing to <span className="serif italic" style={{ color: '#60A5FA' }}>audit</span> yet
         </h3>
-        <p className="text-[14px] max-w-md mx-auto mb-6" style={{ color: '#A1A1AA' }}>
-          Duplicate detection compares Salesforce cases, Zoom meetings, and Calendly bookings. Upload sources from the Import page to see matches here.
+        <p className="text-[14px] max-w-md mx-auto" style={{ color: '#A1A1AA' }}>
+          Duplicate detection compares Salesforce cases, Zoom meetings, and Calendly bookings. Data is still loading or the source files haven't been committed to the repo yet.
         </p>
-        <button className="btn" onClick={onGoImport}>
-          <Upload size={14} /> Go to import
-        </button>
       </section>
     );
   }
@@ -4615,7 +4191,7 @@ function RowDetailModal({ sourceLabel, accent, row, title, subtitle, onClose }) 
  * full ticket.
  */
 
-function SalesforceBonusPage({ bonusRows, salesforceRows, salesforceConfig, hasSalesforce, onGoImport }) {
+function SalesforceBonusPage({ bonusRows, salesforceRows, salesforceConfig, hasSalesforce }) {
   const [inspectingRow, setInspectingRow] = useState(null);
 
   if (!hasSalesforce) {
@@ -4630,12 +4206,9 @@ function SalesforceBonusPage({ bonusRows, salesforceRows, salesforceConfig, hasS
         <h3 className="text-[22px] font-medium mb-2">
           No <span className="serif italic" style={{ color: '#60A5FA' }}>Salesforce</span> data yet
         </h3>
-        <p className="text-[14px] max-w-md mx-auto mb-6" style={{ color: '#A1A1AA' }}>
-          Upload a Salesforce case report to see which tickets qualified for bonus points. AD Connector tickets earn {SALESFORCE_BONUS_POINTS} points instead of 1.
+        <p className="text-[14px] max-w-md mx-auto" style={{ color: '#A1A1AA' }}>
+          Data is still loading or the Salesforce file hasn't been committed to the repo. AD Connector tickets earn {SALESFORCE_BONUS_POINTS} points instead of 1.
         </p>
-        <button className="btn" onClick={onGoImport}>
-          <Upload size={14} /> Go to import
-        </button>
       </section>
     );
   }
@@ -4834,145 +4407,59 @@ function SalesforceBonusPage({ bonusRows, salesforceRows, salesforceConfig, hasS
   );
 }
 
-/* ---------- Sub-component: Google Sign-In gate ----------
- * Loads the Google Identity Services SDK dynamically, renders the official
- * "Sign in with Google" button, and checks the ID token's `hd` claim against
- * ALLOWED_GOOGLE_DOMAIN. Only @classlink.com accounts can proceed.
+
+/* ---------- Sub-component: Password gate ----------
+ * A simple full-screen password prompt. The correct password's SHA-256 hash
+ * is stored in PASSWORD_HASH at the top of this file — never the plaintext.
+ * We hash the user's input and compare hashes.
  *
- * Note: This is a client-side gate. Anyone with devtools can edit state to
- * bypass it. For real security, protect the backing data server-side.
+ * This is NOT a security boundary — devtools can easily bypass it. It's a
+ * friction layer to stop casual access.
  */
-function SignInGate({ onSignIn }) {
-  const buttonRef = useRef(null);
-  const [gsiReady, setGsiReady] = useState(!!window.google?.accounts?.id);
+function PasswordGate({ onUnlock }) {
+  const [value, setValue] = useState('');
   const [error, setError] = useState(null);
-  const [loadError, setLoadError] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [attemptCount, setAttemptCount] = useState(0);
+  const inputRef = useRef(null);
 
-  // Load the Google Identity Services script once. Resilient to:
-  //  - the script already present on the page (from a previous mount)
-  //  - the SDK already loaded on window.google
-  //  - polling for window.google if the onload callback was missed
+  // Auto-focus the input on mount for faster keyboard flow
   useEffect(() => {
-    // Already loaded?
-    if (window.google?.accounts?.id) {
-      setGsiReady(true);
-      return;
-    }
-
-    const scriptId = 'google-identity-services';
-    const existing = document.getElementById(scriptId);
-
-    // Poll for window.google becoming available — handles the case where
-    // onload already fired before this effect attached, or a prior mount's
-    // script is still resolving.
-    let cancelled = false;
-    const startPoll = () => {
-      const start = Date.now();
-      const tick = () => {
-        if (cancelled) return;
-        if (window.google?.accounts?.id) {
-          setGsiReady(true);
-          return;
-        }
-        if (Date.now() - start > 8000) {
-          // Gave up — but be explicit in the error so we know it's a timeout,
-          // not necessarily a network failure.
-          setLoadError(true);
-          return;
-        }
-        setTimeout(tick, 100);
-      };
-      tick();
-    };
-
-    if (existing) {
-      // A previous render already added the script; just wait for it.
-      startPoll();
-      return () => { cancelled = true; };
-    }
-
-    const script = document.createElement('script');
-    script.id = scriptId;
-    script.src = 'https://accounts.google.com/gsi/client';
-    script.async = true;
-    script.defer = true;
-    script.onload = () => {
-      if (!cancelled) setGsiReady(true);
-    };
-    script.onerror = () => {
-      if (!cancelled) setLoadError(true);
-    };
-    document.head.appendChild(script);
-    // Also poll as a fallback (onload sometimes doesn't fire in sandboxed iframes)
-    startPoll();
-
-    return () => { cancelled = true; };
+    if (inputRef.current) inputRef.current.focus();
   }, []);
 
-  // Initialize GIS and render the button once the SDK is loaded
-  useEffect(() => {
-    if (!gsiReady || !buttonRef.current) return;
-    if (!window.google?.accounts?.id) return;
-
-    // Guard against a missing / placeholder client ID
-    if (!GOOGLE_CLIENT_ID || GOOGLE_CLIENT_ID.startsWith('YOUR_')) {
-      setError('No Google OAuth client ID configured. Set GOOGLE_CLIENT_ID at the top of the source file.');
+  const handleSubmit = async (e) => {
+    e?.preventDefault?.();
+    if (!value) {
+      setError('Enter a password to continue.');
       return;
     }
-
-    const handleCredential = (response) => {
-      if (!response?.credential) {
-        setError('Sign-in failed — no credential returned.');
-        return;
-      }
-      const payload = decodeJwtPayload(response.credential);
-      if (!payload) {
-        setError('Sign-in failed — could not read the ID token.');
-        return;
-      }
-      // Domain check. `hd` is set by Google for Workspace accounts only.
-      if (payload.hd !== ALLOWED_GOOGLE_DOMAIN) {
-        const shown = payload.email || 'your account';
-        setError(
-          `Only @${ALLOWED_GOOGLE_DOMAIN} accounts can sign in. ${shown} is not part of that Google Workspace.`
-        );
-        // Also clear any stored auto-select
-        try { window.google.accounts.id.disableAutoSelect(); } catch {}
-        return;
-      }
-      // Accepted. Stash basic profile info.
-      onSignIn({
-        email: payload.email,
-        name: payload.name,
-        picture: payload.picture,
-        sub: payload.sub,
-        hd: payload.hd,
-        signedInAt: Date.now()
-      });
-    };
-
+    setVerifying(true);
+    setError(null);
     try {
-      window.google.accounts.id.initialize({
-        client_id: GOOGLE_CLIENT_ID,
-        callback: handleCredential,
-        // `hd` on init hints the account picker to only show Workspace accounts
-        // from this domain. Still verified on the response above.
-        hd: ALLOWED_GOOGLE_DOMAIN,
-        ux_mode: 'popup',
-        auto_select: false
-      });
-      window.google.accounts.id.renderButton(buttonRef.current, {
-        theme: 'filled_black',
-        size: 'large',
-        shape: 'pill',
-        text: 'signin_with',
-        logo_alignment: 'left',
-        width: 280
-      });
+      const hash = await sha256Hex(value);
+      // Debug: if hash looks wrong length, surface that
+      if (typeof hash !== 'string' || hash.length !== 64) {
+        setError(`Hashing returned an unexpected result. Got: ${typeof hash === 'string' ? `"${hash}" (length ${hash.length})` : typeof hash}`);
+        setVerifying(false);
+        return;
+      }
+      if (hash === PASSWORD_HASH) {
+        onUnlock();
+      } else {
+        setError(`Incorrect password. (hash did not match)`);
+        setAttemptCount(n => n + 1);
+        setTimeout(() => {
+          setValue('');
+          if (inputRef.current) inputRef.current.focus();
+        }, 150);
+      }
     } catch (err) {
-      setError(`Google Sign-In initialization failed: ${err.message || err}`);
+      setError(`Could not verify password: ${err.message || err}`);
+    } finally {
+      setVerifying(false);
     }
-  }, [gsiReady, onSignIn]);
+  };
 
   return (
     <div
@@ -4987,13 +4474,44 @@ function SignInGate({ onSignIn }) {
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap');
         .serif { font-family: 'Instrument Serif', serif; font-weight: 400; }
+        .pg-input {
+          width: 100%;
+          background: #0A0A0B;
+          border: 1px solid #232327;
+          border-radius: 8px;
+          padding: 10px 12px;
+          color: #F4F4F5;
+          font-size: 14px;
+          font-family: 'Geist', sans-serif;
+          transition: border-color 140ms, background 140ms;
+        }
+        .pg-input:focus {
+          outline: none;
+          border-color: rgba(96,165,250,0.5);
+          background: #0E0E10;
+        }
+        .pg-submit {
+          width: 100%;
+          background: #60A5FA;
+          color: #0A0A0B;
+          border: none;
+          border-radius: 8px;
+          padding: 10px 12px;
+          font-weight: 600;
+          font-size: 13.5px;
+          cursor: pointer;
+          transition: opacity 140ms, background 140ms;
+          font-family: 'Geist', sans-serif;
+        }
+        .pg-submit:hover:not(:disabled) { background: #3B82F6; }
+        .pg-submit:disabled { opacity: 0.5; cursor: not-allowed; }
       `}</style>
 
       <div
         className="w-full max-w-md rounded-2xl p-8"
         style={{ background: '#111113', border: '1px solid #232327', boxShadow: '0 30px 80px -40px rgba(0,0,0,0.7)' }}
       >
-        {/* Logo / brand */}
+        {/* Brand */}
         <div className="flex items-center gap-2.5 mb-8">
           <div
             className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0"
@@ -5011,69 +4529,61 @@ function SignInGate({ onSignIn }) {
 
         {/* Headline */}
         <h1 className="text-[28px] leading-[1.1] font-medium tracking-tight mb-3">
-          Sign in with your <span className="serif italic" style={{ color: '#60A5FA' }}>ClassLink</span> account
+          Enter the <span className="serif italic" style={{ color: '#60A5FA' }}>team</span> password
         </h1>
         <p className="text-[13px] mb-7" style={{ color: '#A1A1AA' }}>
-          Tally is restricted to the <span className="mono" style={{ color: '#D4D4D8' }}>@{ALLOWED_GOOGLE_DOMAIN}</span> Google Workspace. Use your work Google account to continue.
+          Tally is a private tool. Ask someone on the Product Support team if you need the password.
         </p>
 
-        {/* Google sign-in button (rendered by GIS) or status */}
-        <div className="mb-5">
-          {loadError ? (
-            <div
-              className="p-3 rounded-lg text-[12.5px] flex items-start gap-2"
-              style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)', color: '#FCA5A5' }}
-            >
-              <AlertCircle size={14} style={{ flexShrink: 0, marginTop: 2 }} />
-              <div className="min-w-0">
-                <div className="font-medium mb-1">Couldn't load Google Sign-In</div>
-                <div style={{ color: '#F87171' }}>
-                  The Google SDK didn't load from{' '}
-                  <span className="mono" style={{ color: '#FCA5A5' }}>accounts.google.com/gsi/client</span>.
-                </div>
-                <ul className="text-[11.5px] mt-2 ml-4 list-disc space-y-1" style={{ color: '#F87171' }}>
-                  <li>If you're inside a sandboxed preview (e.g., an artifact or CodeSandbox), the SDK may be blocked — deploy the app to a real origin instead.</li>
-                  <li>Check that <span className="mono">accounts.google.com</span> isn't blocked by a network policy or ad-blocker.</li>
-                  <li>Open the browser console to see the actual load error.</li>
-                </ul>
-              </div>
-            </div>
-          ) : (
-            <div className="flex flex-col items-center gap-2">
-              <div ref={buttonRef} style={{ minHeight: 40 }} />
-              {!gsiReady && (
-                <div className="text-[12px] flex items-center gap-2" style={{ color: '#71717A' }}>
-                  <span
-                    className="inline-block w-3 h-3 rounded-full"
-                    style={{ background: '#60A5FA', opacity: 0.6, animation: 'pulse 1.4s ease-in-out infinite' }}
-                  />
-                  Loading Google Sign-In…
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-        <style>{`
-          @keyframes pulse { 0%,100% { opacity: 0.3; } 50% { opacity: 1; } }
-        `}</style>
+        <form onSubmit={handleSubmit}>
+          <label
+            htmlFor="password-input"
+            className="block text-[11px] uppercase tracking-[0.16em] mb-2"
+            style={{ color: '#71717A' }}
+          >
+            Password
+          </label>
+          <input
+            ref={inputRef}
+            id="password-input"
+            type="password"
+            className="pg-input mb-4"
+            value={value}
+            onChange={(e) => { setValue(e.target.value); if (error) setError(null); }}
+            disabled={verifying}
+            autoComplete="current-password"
+          />
+          <button
+            type="submit"
+            className="pg-submit mb-5"
+            disabled={verifying || !value}
+          >
+            {verifying ? 'Checking…' : 'Unlock'}
+          </button>
+        </form>
 
-        {/* Error from domain check or init */}
         {error && (
           <div
-            className="p-3 rounded-lg text-[12px] flex items-start gap-2 mb-5"
+            className="p-3 rounded-lg text-[12.5px] flex items-start gap-2 mb-5"
             style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)', color: '#FCA5A5' }}
           >
             <AlertCircle size={14} style={{ flexShrink: 0, marginTop: 2 }} />
-            <div>{error}</div>
+            <div>
+              {error}
+              {attemptCount >= 3 && (
+                <div className="mt-1 text-[11.5px]" style={{ color: '#F87171' }}>
+                  Several failed attempts. Double-check the password with your team lead.
+                </div>
+              )}
+            </div>
           </div>
         )}
 
-        {/* Tiny print */}
         <div
           className="pt-5 text-[11px] leading-relaxed"
           style={{ borderTop: '1px solid var(--border-soft, #232327)', color: '#52525B' }}
         >
-          We only read your name, email, and profile photo from your Google account — just enough to confirm you're part of the {ALLOWED_GOOGLE_DOMAIN} Workspace. All the data you upload stays in your browser.
+          Entering the right password unlocks this device until you clear browser storage. All data you upload stays in your browser and is never transmitted anywhere.
         </div>
       </div>
     </div>
